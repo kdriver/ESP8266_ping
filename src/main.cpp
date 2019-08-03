@@ -1,27 +1,35 @@
 #include <Arduino.h>
 
-#include <Pinger.h>
-#include <PingerResponse.h>
-
 #include <WiFicreds.h>
 #include <ESP8266WiFi.h>
 
+#include <InfluxDb.h>
+
+#define INFLUXDB_HOST "192.168.1.161"
+#define INFLUXDB_PORT "1337"
+#define INFLUXDB_DATABASE "boiler"
+
+#define BOILER_OFF 0
+#define BOILER_ON 1
+#define BOILER_NO_CHANGE 2
+
+#define DEBUG_ON false
+
 bool quiet = false;
-extern "C"
-{
-  #include <lwip/icmp.h> // needed for icmp packet definitions
-}
+unsigned long epoch;
+unsigned long time_now;
+unsigned long since_epoch;
 
-// Set global to avoid object removing after setup() routine
-Pinger pinger;
+unsigned int boiler;
+unsigned int boiler_status= BOILER_OFF;
+unsigned int boiler_switched_on_time;
 
-const char* host = "api.thingspeak.com"; // Your domain  
-String ApiKey = "THINGSPEAK_API_KEY";
-String path = "/update?key=" + ApiKey + "&field1=";  
+Influxdb influx(INFLUXDB_HOST);
+
 
 void setup(void){
   Serial.begin(9600);
-  Serial.println("");
+  Serial.println("I'm alive");
   
   WiFi.begin(ssid, pass);
   // Wait for connection
@@ -36,104 +44,112 @@ void setup(void){
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
-  pinger.OnReceive([](const PingerResponse& response)
-  {
-    if (response.ReceivedResponse)
-    {
-      Serial.printf(
-        "Reply from %s: bytes=%d time=%lums TTL=%d\n",
-        response.DestIPAddress.toString().c_str(),
-        response.EchoMessageSize - sizeof(struct icmp_echo_hdr),
-        response.ResponseTime,
-        response.TimeToLive);
-    }
-    else
-    {
-      Serial.printf("Request timed out.\n");
-    }
+  influx.setDb(INFLUXDB_DATABASE);
 
-    // Return true to continue the ping sequence.
-    // If current event returns false, the ping sequence is interrupted.
-    return true;
-  });
+  epoch = millis()/1000;
 
-  pinger.OnEnd([](const PingerResponse& response)
-  {
-    // Evaluate lost packet percentage
-    float loss = 100;
-    if(response.TotalReceivedResponses > 0)
-    {
-      loss = (response.TotalSentRequests - response.TotalReceivedResponses) * 100 / response.TotalSentRequests;
-    }
-    if ( quiet == false )
-    {
-    // Print packet trip data
-    Serial.printf(
-      "Ping statistics for %s:\n",
-      response.DestIPAddress.toString().c_str());
-    Serial.printf(
-      "    Packets: Sent = %lu, Received = %lu, Lost = %lu (%.2f%% loss),\n",
-      response.TotalSentRequests,
-      response.TotalReceivedResponses,
-      response.TotalSentRequests - response.TotalReceivedResponses,
-      loss);
-
-    // Print time information
-    if(response.TotalReceivedResponses > 0)
-    {
-      Serial.printf("Approximate round trip times in milli-seconds:\n");
-      Serial.printf(
-        "    Minimum = %lums, Maximum = %lums, Average = %.2fms\n",
-        response.MinResponseTime,
-        response.MaxResponseTime,
-        response.AvgResponseTime);
-    }
-    
-    // Print host data
-    Serial.printf("Destination host data:\n");
-    Serial.printf(
-      "    IP address: %s\n",
-      response.DestIPAddress.toString().c_str());
-    if(response.DestMacAddress != nullptr)
-    {
-      Serial.printf(
-        "    MAC address: " MACSTR "\n",
-        MAC2STR(response.DestMacAddress->addr));
-    }
-    if(response.DestHostname != "")
-    {
-      Serial.printf(
-        "    DNS name: %s\n",
-        response.DestHostname.c_str());
-    }
-  }
-    return true;
-  });
-
-  // Ping default gateway
-  Serial.printf(
-    "\n\nPinging default gateway with IP %s\n",
-    WiFi.gatewayIP().toString().c_str());
-  if(pinger.Ping(WiFi.gatewayIP(),10) == false)
-  {
-    Serial.println("Error during last ping command.");
-  }
-
-   
-   delay(10000);
-   quiet = true;
 }
 
+unsigned int smooth_on = 0;
+unsigned int smooth_off = 0;
 
+void tell_influx(unsigned int status, unsigned int time_interval)
+{
+  InfluxData measurement("boiler_status");
+  
+  measurement.addTag("interval",String(time_interval));
+
+  if ( status == BOILER_OFF )
+    measurement.addValue("value",0);
+  else
+    measurement.addValue("value",1);
+    
+    influx.write(measurement);
+  
+}
 
 void loop() {
 
 
-  delay(10000);
-  if(pinger.Ping("8.8.8.8",1) == false)
+  delay(500);
+
+  int a0pin ;
+  
+  
+  a0pin = analogRead(A0);
+
+  since_epoch = (millis()/1000) - epoch;
+
+if ( DEBUG_ON  || !(since_epoch % 300) )
+ {
+  float voltage;
+  voltage = a0pin * 3.3/1024.0;
+  since_epoch = millis() - epoch;
+  Serial.print(since_epoch);
+  Serial.print("\t");
+  Serial.print(a0pin);
+  Serial.print("\t");
+  Serial.println(voltage);
+ }
+  boiler = BOILER_NO_CHANGE;
+
+  if ( (boiler_status == BOILER_OFF ) && (a0pin > 700) )
   {
-    Serial.println("Error during last ping command");
+      smooth_on = smooth_on + 1 ;
+      if ( smooth_on == 3 )
+      {
+         //Serial.println(" Boiler On");
+         boiler = BOILER_ON;
+         smooth_off = 0;
+      }
   }
+  else
+  {
+    smooth_on = 0;
+  }
+
+if ( (boiler_status == BOILER_ON ) && (a0pin <  650) )
+  {
+      smooth_off = smooth_off + 1 ;
+      if ( smooth_off == 3 )
+      {
+         //Serial.println(" Boiler Off");
+         boiler = BOILER_OFF;
+         smooth_on = 0;
+      }
+  }
+  else
+  {
+    smooth_off = 0;
+  }
+
+  switch(boiler)
+  {
+    case BOILER_NO_CHANGE:
+    break;
+    case BOILER_ON:
+      Serial.println("Boiler switched on");
+      boiler_status = BOILER_ON;
+      boiler_switched_on_time = millis()/1000;
+      tell_influx(BOILER_ON,0);
+    break;
+    case BOILER_OFF:
+      if ( boiler_status == BOILER_ON )
+      {
+        int boiler_on_for;
+        boiler_on_for = (millis()/1000) - boiler_switched_on_time;
+        Serial.print("Boiler on for ");
+        Serial.print(boiler_on_for);
+        Serial.print(" seconds , boiler switched OFF\n");
+        tell_influx(BOILER_OFF,boiler_on_for);
+      }
+      boiler_status = BOILER_OFF;
+    break;
+    default:
+      Serial.println("ERROR - Default case in Boiler switch\n");
+  }
+  
+
 
 
 }
